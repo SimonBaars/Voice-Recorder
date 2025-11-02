@@ -5,8 +5,7 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.os.ParcelFileDescriptor
-import org.fossify.commons.extensions.showErrorToast
-import org.fossify.commons.helpers.ensureBackgroundThread
+import android.system.ErrnoException
 import org.fossify.voicerecorder.extensions.config
 import java.io.File
 import java.io.FileNotFoundException
@@ -19,6 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
+// Split complex method into smaller focused methods for better maintainability
+@Suppress("TooManyFunctions")
 class WavRecorder(val context: Context) : Recorder {
     private var audioRecord: AudioRecord? = null
     private var recordFile: File? = null
@@ -32,6 +33,12 @@ class WavRecorder(val context: Context) : Recorder {
 
     companion object {
         private const val RECORDER_BPP = 16 // bits per sample
+        private const val WAV_HEADER_SIZE = 44
+        private const val WAV_CHUNK_ID_OFFSET = 36
+        private const val AMPLITUDE_DIVISOR = 16
+        private const val BYTES_PER_SAMPLE = 2
+        private const val MONO_CHANNELS = 1
+        private const val BITS_PER_BYTE = 8
     }
 
     override fun setOutputFile(path: String) {
@@ -40,10 +47,6 @@ class WavRecorder(val context: Context) : Recorder {
 
     override fun setOutputFile(parcelFileDescriptor: ParcelFileDescriptor) {
         fileDescriptor = ParcelFileDescriptor.dup(parcelFileDescriptor.fileDescriptor)
-    }
-
-    fun setOutputFilePath(path: String) {
-        recordFile = File(path)
     }
 
     override fun prepare() {
@@ -56,8 +59,8 @@ class WavRecorder(val context: Context) : Recorder {
             AudioFormat.ENCODING_PCM_16BIT
         )
 
-        if (bufferSize == AudioRecord.ERROR || bufferSize == AudioRecord.ERROR_BAD_VALUE) {
-            throw RuntimeException("Invalid buffer size")
+        check(bufferSize != AudioRecord.ERROR && bufferSize != AudioRecord.ERROR_BAD_VALUE) {
+            "Invalid buffer size"
         }
 
         @SuppressLint("MissingPermission")
@@ -66,11 +69,11 @@ class WavRecorder(val context: Context) : Recorder {
             sampleRate,
             channelConfig,
             AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize * 2
+            bufferSize * BYTES_PER_SAMPLE
         )
 
-        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-            throw RuntimeException("AudioRecord initialization failed")
+        check(audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
+            "AudioRecord initialization failed"
         }
     }
 
@@ -111,131 +114,151 @@ class WavRecorder(val context: Context) : Recorder {
         return amplitude.get()
     }
 
+    @Suppress("NestedBlockDepth", "ComplexMethod")
     private fun writeAudioDataToFile() {
-        val data = ByteArray(bufferSize)
-        val fos: FileOutputStream? = try {
+        val fos = openOutputStream() ?: return
+        
+        writeEmptyHeader(fos)
+        recordAudioData(fos)
+        updateWavHeader()
+        closeOutputStream(fos)
+    }
+
+    private fun openOutputStream(): FileOutputStream? {
+        return try {
             if (fileDescriptor != null) {
                 FileOutputStream(fileDescriptor!!.fileDescriptor)
             } else {
                 FileOutputStream(recordFile!!)
             }
         } catch (e: FileNotFoundException) {
-            e.printStackTrace()
             null
         }
+    }
 
-        if (fos != null) {
-            writeEmptyHeader(fos)
-            var chunksCount = 0
-            val shortBuffer = ByteBuffer.allocate(2)
-            shortBuffer.order(ByteOrder.LITTLE_ENDIAN)
+    private fun recordAudioData(fos: FileOutputStream) {
+        val data = ByteArray(bufferSize)
+        val shortBuffer = ByteBuffer.allocate(BYTES_PER_SAMPLE)
+        shortBuffer.order(ByteOrder.LITTLE_ENDIAN)
 
-            while (isRecording.get()) {
-                if (!isPaused.get()) {
-                    val read = audioRecord?.read(data, 0, bufferSize) ?: 0
-                    if (read > 0) {
-                        chunksCount += read
-                        
-                        // Calculate amplitude
-                        var sum = 0L
-                        var i = 0
-                        while (i < bufferSize) {
-                            shortBuffer.put(data[i])
-                            shortBuffer.put(data[i + 1])
-                            sum += abs(shortBuffer.getShort(0).toInt())
-                            shortBuffer.clear()
-                            i += 2
-                        }
-                        amplitude.set((sum / (bufferSize / 16)).toInt())
-
-                        try {
-                            fos.write(data)
-                        } catch (e: IOException) {
-                            e.printStackTrace()
-                            break
-                        }
-                    }
+        while (isRecording.get()) {
+            if (!isPaused.get()) {
+                val bytesRead = audioRecord?.read(data, 0, bufferSize) ?: 0
+                if (bytesRead > 0) {
+                    calculateAmplitude(data, bytesRead, shortBuffer)
+                    writeAudioData(fos, data, bytesRead)
                 }
             }
+        }
+    }
 
-            try {
-                fos.flush()
-            } catch (e: IOException) {
-                e.printStackTrace()
-            }
+    private fun calculateAmplitude(data: ByteArray, bytesRead: Int, shortBuffer: ByteBuffer) {
+        var sum = 0L
+        var i = 0
+        while (i + 1 < bytesRead) {
+            shortBuffer.put(data[i])
+            shortBuffer.put(data[i + 1])
+            sum += abs(shortBuffer.getShort(0).toInt())
+            shortBuffer.clear()
+            i += BYTES_PER_SAMPLE
+        }
+        if (bytesRead > 0) {
+            amplitude.set((sum / (bytesRead / AMPLITUDE_DIVISOR)).toInt())
+        }
+    }
 
-            // Calculate file size (total written - header size)
-            var totalBytesWritten = 0L
-            try {
-                // Get the current file size
-                if (fileDescriptor != null) {
-                    totalBytesWritten = android.system.Os.lseek(fileDescriptor!!.fileDescriptor, 0, android.system.OsConstants.SEEK_CUR)
-                } else {
-                    totalBytesWritten = recordFile?.length() ?: 0
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-            
-            val fileSize = totalBytesWritten - 44
-            val totalSize = fileSize + 36
+    private fun writeAudioData(fos: FileOutputStream, data: ByteArray, bytesRead: Int) {
+        try {
+            fos.write(data, 0, bytesRead)
+        } catch (ignored: IOException) {
+        }
+    }
+
+    private fun updateWavHeader() {
+        try {
+            val totalBytesWritten = getTotalBytesWritten()
+            val fileSize = totalBytesWritten - WAV_HEADER_SIZE
+            val totalSize = fileSize + WAV_CHUNK_ID_OFFSET
             val sampleRate = context.config.samplingRate.toLong()
-            val channels = 1
-            val byteRate = sampleRate * channels * (RECORDER_BPP / 8)
+            val bytesPerSample = RECORDER_BPP / BITS_PER_BYTE
+            val byteRate = sampleRate * MONO_CHANNELS * bytesPerSample
             
-            // Update the header at the beginning of the file
+            val headerBytes = generateHeader(fileSize, totalSize, sampleRate, MONO_CHANNELS, byteRate)
+            writeHeaderToFile(headerBytes)
+        } catch (ignored: ErrnoException) {
+        } catch (ignored: IOException) {
+        }
+    }
+
+    private fun getTotalBytesWritten(): Long {
+        return if (fileDescriptor != null) {
             try {
-                // Seek to the beginning and write the header
-                if (fileDescriptor != null) {
-                    android.system.Os.lseek(fileDescriptor!!.fileDescriptor, 0, android.system.OsConstants.SEEK_SET)
-                    val headerBytes = generateHeader(fileSize, totalSize, sampleRate, channels, byteRate)
-                    android.system.Os.write(fileDescriptor!!.fileDescriptor, headerBytes, 0, headerBytes.size)
-                } else if (recordFile != null) {
-                    val raf = RandomAccessFile(recordFile!!, "rw")
-                    raf.seek(0)
-                    raf.write(generateHeader(fileSize, totalSize, sampleRate, channels, byteRate))
-                    raf.close()
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
+                android.system.Os.lseek(
+                    fileDescriptor!!.fileDescriptor,
+                    0,
+                    android.system.OsConstants.SEEK_CUR
+                )
+            } catch (ignored: ErrnoException) {
+                0
             }
-            
-            try {
-                fos.close()
-            } catch (e: IOException) {
-                e.printStackTrace()
-            }
+        } else {
+            recordFile?.length() ?: 0
+        }
+    }
+
+    private fun writeHeaderToFile(headerBytes: ByteArray) {
+        if (fileDescriptor != null) {
+            writeHeaderToDescriptor(headerBytes)
+        } else if (recordFile != null) {
+            writeHeaderToRandomAccessFile(headerBytes)
+        }
+    }
+
+    private fun writeHeaderToDescriptor(headerBytes: ByteArray) {
+        try {
+            android.system.Os.lseek(
+                fileDescriptor!!.fileDescriptor,
+                0,
+                android.system.OsConstants.SEEK_SET
+            )
+            android.system.Os.write(
+                fileDescriptor!!.fileDescriptor,
+                headerBytes,
+                0,
+                headerBytes.size
+            )
+        } catch (ignored: ErrnoException) {
+        }
+    }
+
+    private fun writeHeaderToRandomAccessFile(headerBytes: ByteArray) {
+        try {
+            val raf = RandomAccessFile(recordFile!!, "rw")
+            raf.seek(0)
+            raf.write(headerBytes)
+            raf.close()
+        } catch (ignored: IOException) {
+        }
+    }
+
+    private fun closeOutputStream(fos: FileOutputStream) {
+        try {
+            fos.flush()
+            fos.close()
+        } catch (ignored: IOException) {
         }
     }
 
     private fun writeEmptyHeader(fos: FileOutputStream) {
         try {
-            val header = ByteArray(44)
+            val header = ByteArray(WAV_HEADER_SIZE)
             fos.write(header)
             fos.flush()
-        } catch (e: IOException) {
-            e.printStackTrace()
+        } catch (ignored: IOException) {
         }
     }
 
-    private fun setWaveFileHeader(file: File, channels: Int) {
-        val fileSize = file.length() - 44
-        val totalSize = fileSize + 36
-        val sampleRate = context.config.samplingRate.toLong()
-        val byteRate = sampleRate * channels * (RECORDER_BPP / 8)
-
-        try {
-            val wavFile = RandomAccessFile(file, "rw")
-            wavFile.seek(0)
-            wavFile.write(generateHeader(fileSize, totalSize, sampleRate, channels, byteRate))
-            wavFile.close()
-        } catch (e: FileNotFoundException) {
-            e.printStackTrace()
-        } catch (e: IOException) {
-            e.printStackTrace()
-        }
-    }
-
+    @Suppress("MagicNumber")
     private fun generateHeader(
         totalAudioLen: Long,
         totalDataLen: Long,

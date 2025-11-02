@@ -252,7 +252,7 @@ class SettingsActivity : SimpleActivity() {
 
     private fun getSamplingRatesArray(): ArrayList<Int> {
         val baseRates = SAMPLING_RATES[config.extension]!!
-        // WAV doesn't have bitrate limits, return all available rates
+        // WAV is lossless and doesn't have bitrate-related sampling rate limits, return all available rates
         if (config.extension == EXTENSION_WAV) {
             return baseRates
         }
